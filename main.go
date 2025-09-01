@@ -8,19 +8,20 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// 配置常量
-const (
-	UPSTREAM_URL   = "https://chat.z.ai/api/chat/completions"
-	DEFAULT_KEY    = "sk-your-key"                                                                                                                                                                                                                                    // 下游客户端鉴权key
-	UPSTREAM_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ" // 上游API的token（回退用）
-	MODEL_NAME     = "GLM-4.5"
-	PORT           = ":8080"
-	DEBUG_MODE     = true // debug模式开关
+// 配置变量（从环境变量读取）
+var (
+	UPSTREAM_URL   string
+	DEFAULT_KEY    string
+	UPSTREAM_TOKEN string
+	MODEL_NAME     string
+	PORT           string
+	DEBUG_MODE     bool
 )
 
 // 思考内容处理策略
@@ -40,6 +41,30 @@ const (
 
 // 匿名token开关
 const ANON_TOKEN_ENABLED = true
+
+// 从环境变量初始化配置
+func initConfig() {
+	UPSTREAM_URL = getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions")
+	DEFAULT_KEY = getEnv("DEFAULT_KEY", "sk-your-key")
+	UPSTREAM_TOKEN = getEnv("UPSTREAM_TOKEN", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ")
+	MODEL_NAME = getEnv("MODEL_NAME", "GLM-4.5")
+	PORT = getEnv("PORT", "8080")
+	
+	// 处理PORT格式，确保有冒号前缀
+	if !strings.HasPrefix(PORT, ":") {
+		PORT = ":" + PORT
+	}
+	
+	DEBUG_MODE = getEnv("DEBUG_MODE", "true") == "true"
+}
+
+// 获取环境变量，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // OpenAI 请求结构
 type OpenAIRequest struct {
@@ -183,6 +208,9 @@ func getAnonymousToken() (string, error) {
 }
 
 func main() {
+	// 初始化配置
+	initConfig()
+	
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	http.HandleFunc("/", handleOptions)
