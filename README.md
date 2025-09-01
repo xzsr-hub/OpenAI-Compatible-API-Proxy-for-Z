@@ -1,3 +1,44 @@
+<<<<<<< main
+# OpenAI兼容API代理 for Z.ai GLM-4.5
+
+这是一个为Z.ai GLM-4.5模型提供OpenAI兼容API接口的代理服务器。
+
+## Render部署
+
+1. Fork这个仓库到你的GitHub账户
+
+2. 在Render上创建新的Web Service：
+   - 连接你的GitHub仓库
+   - 选择Docker作为环境
+   - 设置以下环境变量：
+   - `UPSTREAM_TOKEN`: Z.ai 的访问令牌 (必需)
+   - `DEFAULT_KEY`: 客户端API密钥 (可选，默认: sk-your-key)
+   - `MODEL_NAME`: 显示的模型名称 (可选，默认: GLM-4.5)
+   - `DEFAULT_STREAM`: 默认流式响应 (可选，默认: true)
+   - `PORT`: 服务监听端口 (Render会自动设置)
+
+3. 部署完成后，使用Render提供的URL作为OpenAI API的base_url
+
+## 使用示例
+
+```python
+import openai
+
+client = openai.OpenAI(
+    api_key="your-api-key",  # 对应 DEFAULT_KEY
+    base_url="https://your-app.onrender.com/v1"
+)
+
+response = client.chat.completions.create(
+    model="GLM-4.5",
+    messages=[{"role": "user", "content": "你好"}],
+    stream=True
+)
+
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+=======
 # OpenAI-Compatible API Proxy for Z.ai
 
 ## 项目简介
@@ -71,10 +112,12 @@
 | `DEBUG_MODE` | 调试模式开关 | `true` |
 | `THINK_TAGS_MODE` | 思考内容处理策略 | `strip` (可选: `think`, `raw`) |
 | `ANON_TOKEN_ENABLED` | 是否使用匿名 token | `true` |
+>>>>>>> main
 
 ## 贡献指南
 
 欢迎提交 Issue 和 Pull Request！请确保：
+
 1. 代码符合 Go 的代码风格
 2. 提交前运行测试
 3. 更新相关文档
