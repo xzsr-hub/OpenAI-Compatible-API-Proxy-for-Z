@@ -23,8 +23,8 @@
 
 1. 克隆仓库：
    ```bash
-   git clone https://github.com/yourusername/zai-openai-proxy.git
-   cd zai-openai-proxy
+   git clone https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z.git
+   cd OpenAI-Compatible-API-Proxy-for-Z
    ```
 
 2. 修改配置（可选）：
