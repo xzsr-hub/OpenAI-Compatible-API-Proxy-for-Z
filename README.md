@@ -13,6 +13,7 @@
      - `UPSTREAM_TOKEN`: Z.ai 的访问令牌 (必需)
      - `DEFAULT_KEY`: 客户端API密钥 (可选，默认: sk-your-key)
      - `MODEL_NAME`: 显示的模型名称 (可选，默认: GLM-4.5)
+     - `DEFAULT_STREAM`: 默认流式响应 (可选，默认: true)
      - `PORT`: 服务监听端口 (Render会自动设置)
 
 3. 部署完成后，使用Render提供的URL作为OpenAI API的base_url

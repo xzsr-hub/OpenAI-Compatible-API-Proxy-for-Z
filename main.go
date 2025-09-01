@@ -16,12 +16,13 @@ import (
 
 // 配置变量（从环境变量读取）
 var (
-	UPSTREAM_URL   string
-	DEFAULT_KEY    string
-	UPSTREAM_TOKEN string
-	MODEL_NAME     string
-	PORT           string
-	DEBUG_MODE     bool
+	UPSTREAM_URL     string
+	DEFAULT_KEY      string
+	UPSTREAM_TOKEN   string
+	MODEL_NAME       string
+	PORT             string
+	DEBUG_MODE       bool
+	DEFAULT_STREAM   bool
 )
 
 // 思考内容处理策略
@@ -56,6 +57,7 @@ func initConfig() {
 	}
 	
 	DEBUG_MODE = getEnv("DEBUG_MODE", "true") == "true"
+	DEFAULT_STREAM = getEnv("DEFAULT_STREAM", "true") == "true"
 }
 
 // 获取环境变量，如果不存在则返回默认值
@@ -219,6 +221,7 @@ func main() {
 	log.Printf("模型: %s", MODEL_NAME)
 	log.Printf("上游: %s", UPSTREAM_URL)
 	log.Printf("Debug模式: %v", DEBUG_MODE)
+	log.Printf("默认流式响应: %v", DEFAULT_STREAM)
 	log.Fatal(http.ListenAndServe(PORT, nil))
 }
 
@@ -287,12 +290,26 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("API key验证通过")
 
+	// 读取请求体
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		debugLog("读取请求体失败: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
 	// 解析请求
 	var req OpenAIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		debugLog("JSON解析失败: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
+	}
+
+	// 如果客户端没有明确指定stream参数，使用默认值
+	if !bytes.Contains(body, []byte(`"stream"`)) {
+		req.Stream = DEFAULT_STREAM
+		debugLog("客户端未指定stream参数，使用默认值: %v", DEFAULT_STREAM)
 	}
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
