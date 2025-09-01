@@ -8,19 +8,21 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// 配置常量
-const (
-	UPSTREAM_URL   = "https://chat.z.ai/api/chat/completions"
-	DEFAULT_KEY    = "sk-your-key"                                                                                                                                                                                                                                    // 下游客户端鉴权key
-	UPSTREAM_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ" // 上游API的token（回退用）
-	MODEL_NAME     = "GLM-4.5"
-	PORT           = ":8080"
-	DEBUG_MODE     = true // debug模式开关
+// 配置变量（从环境变量读取）
+var (
+	UPSTREAM_URL     string
+	DEFAULT_KEY      string
+	UPSTREAM_TOKEN   string
+	MODEL_NAME       string
+	PORT             string
+	DEBUG_MODE       bool
+	DEFAULT_STREAM   bool
 )
 
 // 思考内容处理策略
@@ -40,6 +42,31 @@ const (
 
 // 匿名token开关
 const ANON_TOKEN_ENABLED = true
+
+// 从环境变量初始化配置
+func initConfig() {
+	UPSTREAM_URL = getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions")
+	DEFAULT_KEY = getEnv("DEFAULT_KEY", "sk-your-key")
+	UPSTREAM_TOKEN = getEnv("UPSTREAM_TOKEN", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ")
+	MODEL_NAME = getEnv("MODEL_NAME", "GLM-4.5")
+	PORT = getEnv("PORT", "8080")
+	
+	// 处理PORT格式，确保有冒号前缀
+	if !strings.HasPrefix(PORT, ":") {
+		PORT = ":" + PORT
+	}
+	
+	DEBUG_MODE = getEnv("DEBUG_MODE", "true") == "true"
+	DEFAULT_STREAM = getEnv("DEFAULT_STREAM", "true") == "true"
+}
+
+// 获取环境变量，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // OpenAI 请求结构
 type OpenAIRequest struct {
@@ -183,6 +210,9 @@ func getAnonymousToken() (string, error) {
 }
 
 func main() {
+	// 初始化配置
+	initConfig()
+	
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	http.HandleFunc("/", handleOptions)
@@ -191,6 +221,7 @@ func main() {
 	log.Printf("模型: %s", MODEL_NAME)
 	log.Printf("上游: %s", UPSTREAM_URL)
 	log.Printf("Debug模式: %v", DEBUG_MODE)
+	log.Printf("默认流式响应: %v", DEFAULT_STREAM)
 	log.Fatal(http.ListenAndServe(PORT, nil))
 }
 
@@ -259,12 +290,26 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("API key验证通过")
 
+	// 读取请求体
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		debugLog("读取请求体失败: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
 	// 解析请求
 	var req OpenAIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		debugLog("JSON解析失败: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
+	}
+
+	// 如果客户端没有明确指定stream参数，使用默认值
+	if !bytes.Contains(body, []byte(`"stream"`)) {
+		req.Stream = DEFAULT_STREAM
+		debugLog("客户端未指定stream参数，使用默认值: %v", DEFAULT_STREAM)
 	}
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
