@@ -1,431 +1,747 @@
-// Cloudflare Worker: OpenAI to Z.ai Proxy (最终完整版)
-// 该脚本整合了所有功能：严格的 OpenAI 格式匹配和动态模型列表获取。
+package main
 
-// ================= Configuration ==================
-// 建议在 Cloudflare 的环境变量中设置这些值 (Settings > Variables)
-// SECRET_* 的值应该设置为机密 (Secrets)
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+)
 
-const UPSTREAM_URL = "https://chat.z.ai/api/chat/completions";
-// 下游客户端鉴权的 key
-const DOWNSTREAM_KEY = "sk-xuzishiran91"; // 建议在环境变量中设置: env.DOWNSTREAM_KEY
-// 上游 API 的备用 token
-const UPSTREAM_TOKEN = "sk-xuzishiran91"; // 建议在环境变量中设置为机密: env.UPSTREAM_TOKEN
-const DEBUG_MODE = true;
-// 思考内容处理策略: "strip" | "think" | "raw"
-const THINK_TAGS_MODE = "strip";
-// 是否启用匿名 token
-const ANON_TOKEN_ENABLED = true;
-// ================================================
+// 配置常量
+const (
+	UpstreamUrl       = "https://chat.z.ai/api/chat/completions"
+	DefaultKey        = "sk-tbkFoKzk9a531YyUNNF5"                                                                                                                                                                                                            // 下游客户端鉴权key
+	UpstreamToken     = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ" // 上游API的token（回退用）
+	DefaultModelName  = "GLM-4.5"
+	ThinkingModelName = "GLM-4.5-Thinking"
+	SearchModelName   = "GLM-4.5-Search"
+	Port              = ":8080"
+	DebugMode         = true // debug模式开关
+)
 
-const ORIGIN_BASE = "https://chat.z.ai";
-const SYSTEM_FINGERPRINT = "fp_generated_by_proxy"; // 静态系统指纹
+// ThinkTagsMode 思考内容处理策略
+const (
+	ThinkTagsMode = "think" // strip: 去除<details>标签；think: 转为<think>标签；raw: 保留原样
+)
 
-// 伪装的前端头部信息
-const FAKE_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0",
-  "Accept": "application/json, text/event-stream",
-  "Accept-Language": "zh-CN, en-US",
-  "sec-ch-ua": "\"Not;A=Brand\";v=\"99\", \"Microsoft Edge\";v=\"139\", \"Chromium\";v=\"139\"",
-  "sec-ch-ua-mobile": "?0",
-  "sec-ch-ua-platform": "\"Windows\"",
-  "X-FE-Version": "prod-fe-1.0.70",
-  "Origin": ORIGIN_BASE,
-};
+// 伪装前端头部（来自抓包）
+const (
+	XFeVersion  = "prod-fe-1.0.70"
+	BrowserUa   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"
+	SecChUa     = "\"Not;A=Brand\";v=\"99\", \"Microsoft Edge\";v=\"139\", \"Chromium\";v=\"139\""
+	SecChUaMob  = "?0"
+	SecChUaPlat = "\"Windows\""
+	OriginBase  = "https://chat.z.ai"
+)
 
-function debugLog(...args) {
-  if (DEBUG_MODE) {
-    console.log("[DEBUG]", ...args);
-  }
+// AnonTokenEnabled 匿名token开关
+const AnonTokenEnabled = true
+
+// OpenAIRequest OpenAI 请求结构
+type OpenAIRequest struct {
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Stream      bool      `json:"stream,omitempty"`
+	Temperature float64   `json:"temperature,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
 }
 
-async function handleRequest(request, env) {
-  const url = new URL(request.url);
-  if (request.method === "OPTIONS") return handleCors();
-
-  if (url.pathname === "/v1/models") {
-    return handleModels(request, env);
-  }
-  if (url.pathname === "/v1/chat/completions") {
-    return handleChatCompletions(request, env);
-  }
-
-  return new Response("Not Found", { status: 404 });
+// Message 消息结构
+type Message struct {
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
-function handleCors() {
-  const headers = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-  return new Response(null, { status: 204, headers });
+// UpstreamRequest 上游请求结构
+type UpstreamRequest struct {
+	Stream          bool                   `json:"stream"`
+	Model           string                 `json:"model"`
+	Messages        []Message              `json:"messages"`
+	Params          map[string]interface{} `json:"params"`
+	Features        map[string]interface{} `json:"features"`
+	BackgroundTasks map[string]bool        `json:"background_tasks,omitempty"`
+	ChatID          string                 `json:"chat_id,omitempty"`
+	ID              string                 `json:"id,omitempty"`
+	MCPServers      []string               `json:"mcp_servers,omitempty"`
+	ModelItem       struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		OwnedBy string `json:"owned_by"`
+	} `json:"model_item,omitempty"`
+	ToolServers []string          `json:"tool_servers,omitempty"`
+	Variables   map[string]string `json:"variables,omitempty"`
 }
 
-function applyCors(response) {
-    response.headers.set("Access-Control-Allow-Origin", "*");
-    response.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    return response;
+// OpenAIResponse OpenAI 响应结构
+type OpenAIResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage,omitempty"`
 }
 
-async function handleModels(request, env) {
-  // 为获取模型列表单独处理认证和头部信息
-  let authToken = env.UPSTREAM_TOKEN || UPSTREAM_TOKEN;
-  const useAnonToken = (env.ANON_TOKEN_ENABLED !== undefined) ? env.ANON_TOKEN_ENABLED === 'true' : ANON_TOKEN_ENABLED;
-  if (useAnonToken) {
-    try {
-      const anonToken = await getAnonymousToken();
-      authToken = anonToken;
-      debugLog("匿名 token 获取成功 (for models)");
-    } catch (err) {
-      debugLog("匿名 token 获取失败 (for models)，回退固定 token:", err.message);
-    }
-  }
-
-  const headers = {
-    ...FAKE_HEADERS,
-    "Accept": "application/json", // FIX: 为此端点使用正确的 Accept 头
-    "Authorization": `Bearer ${authToken}`,
-    "Referer": `${ORIGIN_BASE}/`,
-    "Cookie": `token=${authToken}`,
-  };
-
-  let responseData;
-  try {
-    debugLog("正在从上游获取模型列表:", 'https://chat.z.ai/api/models');
-    const upstreamResponse = await fetch('https://chat.z.ai/api/models', { headers });
-
-    if (!upstreamResponse.ok) {
-      const errorBody = await upstreamResponse.text();
-      debugLog(`上游 models API 返回错误: ${upstreamResponse.status}`, errorBody);
-      throw new Error(`上游 models API 返回状态 ${upstreamResponse.status}`);
-    }
-
-    const upstreamJson = await upstreamResponse.json();
-
-    // 将上游响应转换为 OpenAI 格式
-    const transformedModels = upstreamJson.data.map(model => ({
-      id: model.id,
-      object: "model",
-      created: model.created_at, // 使用源数据中的 'created_at' 时间戳
-      owned_by: model.owned_by,
-    }));
-
-    responseData = {
-      object: "list",
-      data: transformedModels,
-    };
-
-  } catch (error) {
-    debugLog("获取或处理上游模型列表失败:", error);
-    // 返回一个空列表作为备用方案，以避免客户端错误
-    responseData = {
-      object: "list",
-      data: [],
-    };
-  }
-
-  const response = new Response(JSON.stringify(responseData), {
-    headers: { "Content-Type": "application/json" },
-  });
-  return applyCors(response);
+// Choice 选择结构
+type Choice struct {
+	Index        int     `json:"index"`
+	Message      Message `json:"message,omitempty"`
+	Delta        Delta   `json:"delta,omitempty"`
+	FinishReason string  `json:"finish_reason,omitempty"`
 }
 
-
-async function handleChatCompletions(request, env) {
-  debugLog("收到 chat completions 请求");
-
-  const authHeader = request.headers.get("Authorization") || "";
-  const apiKey = authHeader.replace("Bearer ", "");
-  const expectedKey = env.DOWNSTREAM_KEY || DOWNSTREAM_KEY;
-
-  if (apiKey !== expectedKey) {
-    debugLog("无效的 API key:", apiKey);
-    return applyCors(new Response("Invalid API key", { status: 401 }));
-  }
-  debugLog("API key 验证通过");
-
-  let openaiReq;
-  try {
-    openaiReq = await request.json();
-  } catch (e) {
-    debugLog("JSON 解析失败:", e);
-    return applyCors(new Response("Invalid JSON", { status: 400 }));
-  }
-  debugLog(`请求解析成功 - 模型: ${openaiReq.model}, 流式: ${openaiReq.stream}`);
-
-  const chatID = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-  const upstreamReq = {
-    stream: true, // 总是从上游以流式获取，便于统一处理
-    chat_id: chatID,
-    id: `${Date.now()}`,
-    model: openaiReq.model, // 直接使用客户端指定的模型ID
-    messages: openaiReq.messages.map(msg => ({
-      role: msg.role === 'developer' ? 'system' : msg.role, // 角色规范化
-      content: msg.content
-    })),
-    params: {},
-    features: { enable_thinking: true },
-    background_tasks: { title_generation: false, tags_generation: false },
-  };
-
-  let authToken = env.UPSTREAM_TOKEN || UPSTREAM_TOKEN;
-  const useAnonToken = (env.ANON_TOKEN_ENABLED !== undefined) ? env.ANON_TOKEN_ENABLED === 'true' : ANON_TOKEN_ENABLED;
-  if (useAnonToken) {
-    try {
-      const anonToken = await getAnonymousToken();
-      authToken = anonToken;
-      debugLog("匿名 token 获取成功");
-    } catch (err) {
-      debugLog("匿名 token 获取失败，回退固定 token:", err.message);
-    }
-  }
-  
-  const upstreamResponse = await callUpstream(upstreamReq, chatID, authToken);
-
-  if (!upstreamResponse.ok) {
-      const errorBody = await upstreamResponse.text();
-      debugLog(`上游错误: ${upstreamResponse.status}`, errorBody);
-      return applyCors(new Response("Upstream error", { status: 502 }));
-  }
-
-  if (openaiReq.stream) {
-    const stream = processUpstreamStream(upstreamResponse.body, openaiReq);
-    const response = new Response(stream, {
-        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" }
-    });
-    return applyCors(response);
-  } else {
-    const fullContent = await collectFullResponse(upstreamResponse.body);
-    // 构造严格匹配的非流式响应
-    const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: openaiReq.model,
-        choices: [{
-            index: 0,
-            message: {
-                role: "assistant",
-                content: fullContent,
-                refusal: null,
-                annotations: [],
-            },
-            logprobs: null,
-            finish_reason: "stop",
-        }],
-        usage: { // 填充 usage 结构
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
-            completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 }
-        },
-        service_tier: "default",
-        system_fingerprint: SYSTEM_FINGERPRINT,
-    };
-    const response = new Response(JSON.stringify(openaiResponse), {
-        headers: { 'Content-Type': 'application/json' }
-    });
-    return applyCors(response);
-  }
+// Delta 增量结构
+type Delta struct {
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
-async function getAnonymousToken() {
-  const reqHeaders = { ...FAKE_HEADERS };
-  delete reqHeaders.Accept; // getAnonymousToken 不需要指定 Accept
-  reqHeaders.Referer = ORIGIN_BASE + "/";
-
-  const response = await fetch(`${ORIGIN_BASE}/api/v1/auths/`, {
-    method: "GET",
-    headers: reqHeaders,
-  });
-
-  if (!response.ok) throw new Error(`anon token status=${response.status}`);
-  const data = await response.json();
-  if (!data.token) throw new Error("anon token empty");
-  return data.token;
+// Usage 用量结构
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
-async function callUpstream(upstreamReq, refererChatID, authToken) {
-  const reqBody = JSON.stringify(upstreamReq);
-  debugLog("上游请求体:", reqBody);
-
-  const headers = {
-    ...FAKE_HEADERS,
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${authToken}`,
-    "Referer": `${ORIGIN_BASE}/c/${refererChatID}`,
-    "Cookie": `token=${authToken}`,
-  };
-
-  return fetch(UPSTREAM_URL, { method: "POST", headers, body: reqBody });
+// UpstreamData 上游SSE响应结构
+type UpstreamData struct {
+    Type string `json:"type"`
+    Data struct {
+        DeltaContent string         `json:"delta_content"`
+        EditContent  string         `json:"edit_content"`
+        Phase        string         `json:"phase"`
+        Done         bool           `json:"done"`
+        Usage        Usage          `json:"usage,omitempty"`
+        Error        *UpstreamError `json:"error,omitempty"`
+        Inner        *struct {
+            Error *UpstreamError `json:"error,omitempty"`
+        } `json:"data,omitempty"`
+    } `json:"data"`
+    Error *UpstreamError `json:"error,omitempty"`
 }
 
-function processUpstreamStream(upstreamBody, openaiReq) {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const includeUsage = openaiReq.stream_options && openaiReq.stream_options.include_usage === true;
-
-  return new ReadableStream({
-    async start(controller) {
-      const modelIdentifier = openaiReq.model;
-      
-      // 第一个 chunk
-      const firstChunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: modelIdentifier,
-        system_fingerprint: SYSTEM_FINGERPRINT,
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, logprobs: null, finish_reason: null }],
-      };
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify(firstChunk)}\n\n`));
-      
-      const reader = upstreamBody.getReader();
-
-      async function pump() {
-        const { done, value } = await reader.read();
-        if (done) {
-          // 流结束
-          const endChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: modelIdentifier,
-            system_fingerprint: SYSTEM_FINGERPRINT,
-            choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: "stop" }],
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
-
-          if (includeUsage) {
-            const usageChunk = {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: modelIdentifier,
-              system_fingerprint: SYSTEM_FINGERPRINT,
-              choices: [], // Usage chunk has empty choices
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`));
-          }
-
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-          return;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const dataStr = line.substring(6);
-          if (!dataStr) continue;
-          
-          try {
-            const upstreamData = JSON.parse(dataStr);
-            if (upstreamData.error || (upstreamData.data && upstreamData.data.error)) {
-              debugLog("上游错误:", upstreamData.error || upstreamData.data.error);
-              continue; // 忽略错误块
-            }
-
-            if (upstreamData.data && upstreamData.data.delta_content) {
-              let out = upstreamData.data.delta_content;
-              if (upstreamData.data.phase === "thinking") {
-                out = transformThinking(out);
-              }
-              if (out) {
-                const chunk = {
-                    id: `chatcmpl-${Date.now()}`,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: modelIdentifier,
-                    system_fingerprint: SYSTEM_FINGERPRINT,
-                    choices: [{ index: 0, delta: { content: out }, logprobs: null, finish_reason: null }],
-                };
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-              }
-            }
-
-            if (upstreamData.data && (upstreamData.data.done || upstreamData.data.phase === "done")) {
-              // 上游已完成，但我们等待reader.read()的done信号来发送最终块
-              // 这样可以确保所有缓冲的数据都已处理
-              continue;
-            }
-          } catch (e) {
-            debugLog("SSE 数据解析失败:", dataStr, e);
-          }
-        }
-        return pump();
-      }
-      await pump();
-    },
-  });
+// UpstreamError 上游错误结构
+type UpstreamError struct {
+	Detail string `json:"detail"`
+	Code   int    `json:"code"`
 }
 
-async function collectFullResponse(upstreamBody) {
-    const reader = upstreamBody.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let fullContent = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-
-        for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const dataStr = line.substring(6);
-            if (!dataStr) continue;
-
-            try {
-                const upstreamData = JSON.parse(dataStr);
-                if (upstreamData.data && upstreamData.data.delta_content) {
-                    let out = upstreamData.data.delta_content;
-                    if (upstreamData.data.phase === "thinking") {
-                        out = transformThinking(out);
-                    }
-                    if (out) fullContent += out;
-                }
-                if (upstreamData.data && (upstreamData.data.done || upstreamData.data.phase === "done")) {
-                    await reader.cancel();
-                    return fullContent;
-                }
-            } catch (e) {}
-        }
-    }
-    return fullContent;
+// ModelsResponse 模型列表响应
+type ModelsResponse struct {
+	Object string  `json:"object"`
+	Data   []Model `json:"data"`
 }
 
-function transformThinking(s) {
-    if (!s) return "";
-    s = s.replace(/<summary>.*?<\/summary>/gs, "");
-    s = s.replace(/<\/thinking>|<Full>|<\/Full>/g, "");
-    s = s.trim();
-
-    const mode = THINK_TAGS_MODE; // Can be overridden by env vars
-    switch (mode) {
-        case "think":
-            s = s.replace(/<details[^>]*>/g, "<think>").replace(/<\/details>/g, "</think>");
-            break;
-        case "strip":
-            s = s.replace(/<details[^>]*>/g, "").replace(/<\/details>/g, "");
-            break;
-    }
-
-    if (s.startsWith("> ")) s = s.substring(2);
-    s = s.replace(/\n> /g, "\n");
-    return s.trim();
+// Model 模型结构
+type Model struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
 }
 
-export default {
-  fetch: handleRequest,
-};
+// debug日志函数
+func debugLog(format string, args ...interface{}) {
+	if DebugMode {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
+
+// 获取匿名token（每次对话使用不同token，避免共享记忆）
+func getAnonymousToken() (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", OriginBase+"/api/v1/auths/", nil)
+	if err != nil {
+		return "", err
+	}
+	// 伪装浏览器头
+	req.Header.Set("User-Agent", BrowserUa)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("X-FE-Version", XFeVersion)
+	req.Header.Set("sec-ch-ua", SecChUa)
+	req.Header.Set("sec-ch-ua-mobile", SecChUaMob)
+	req.Header.Set("sec-ch-ua-platform", SecChUaPlat)
+	req.Header.Set("Origin", OriginBase)
+	req.Header.Set("Referer", OriginBase+"/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("anon token status=%d", resp.StatusCode)
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	if body.Token == "" {
+		return "", fmt.Errorf("anon token empty")
+	}
+	return body.Token, nil
+}
+
+func main() {
+	http.HandleFunc("/v1/models", handleModels)
+	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	http.HandleFunc("/", handleOptions)
+
+	log.Printf("OpenAI兼容API服务器启动在端口%s", Port)
+	log.Printf("模型: %s", DebugMode)
+	log.Printf("上游: %s", UpstreamUrl)
+	log.Printf("Debug模式: %v", DebugMode)
+	log.Fatal(http.ListenAndServe(Port, nil))
+}
+
+func handleOptions(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+
+func handleModels(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	response := ModelsResponse{
+		Object: "list",
+		Data: []Model{
+			{
+				ID:      DefaultModelName,
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "z.ai",
+			},
+			{
+				ID:      ThinkingModelName,
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "z.ai",
+			},
+			{
+				ID:      SearchModelName,
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "z.ai",
+			},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	debugLog("收到chat completions请求")
+
+	// 验证API Key
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		debugLog("缺少或无效的Authorization头")
+		http.Error(w, "Missing or invalid Authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+	if apiKey != DefaultKey {
+		debugLog("无效的API key: %s", apiKey)
+		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		return
+	}
+
+	debugLog("API key验证通过")
+
+	// 解析请求
+	var req OpenAIRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		debugLog("JSON解析失败: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
+
+	// 生成会话相关ID
+	chatID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().Unix())
+	msgID := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	var isThing bool
+	var isSearch bool
+	var searchMcp string
+	if req.Model == ThinkingModelName {
+		isThing = true
+	} else if req.Model == SearchModelName {
+		isThing = true
+		isSearch = true
+		searchMcp = "deep-web-search"
+	}
+
+	// 构造上游请求
+	upstreamReq := UpstreamRequest{
+		Stream:   true, // 总是使用流式从上游获取
+		ChatID:   chatID,
+		ID:       msgID,
+		Model:    "0727-360B-API", // 上游实际模型ID
+		Messages: req.Messages,
+		Params:   map[string]interface{}{},
+		Features: map[string]interface{}{
+			"enable_thinking": isThing,
+			"web_search":      isSearch,
+			"auto_web_search": isSearch,
+		},
+		BackgroundTasks: map[string]bool{
+			"title_generation": false,
+			"tags_generation":  false,
+		},
+		MCPServers: []string{
+			searchMcp,
+		},
+		ModelItem: struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			OwnedBy string `json:"owned_by"`
+		}{ID: "0727-360B-API", Name: "GLM-4.5", OwnedBy: "openai"},
+		ToolServers: []string{},
+		Variables: map[string]string{
+			"{{USER_NAME}}":        "User",
+			"{{USER_LOCATION}}":    "Unknown",
+			"{{CURRENT_DATETIME}}": time.Now().Format("2006-01-02 15:04:05"),
+		},
+	}
+
+	// 选择本次对话使用的token
+	authToken := UpstreamToken
+	if AnonTokenEnabled {
+		if t, err := getAnonymousToken(); err == nil {
+			authToken = t
+			debugLog("匿名token获取成功: %s...", func() string {
+				if len(t) > 10 {
+					return t[:10]
+				}
+				return t
+			}())
+		} else {
+			debugLog("匿名token获取失败，回退固定token: %v", err)
+		}
+	}
+
+	// 调用上游API
+	if req.Stream {
+		handleStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+	} else {
+		handleNonStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+	}
+}
+
+func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string) (*http.Response, error) {
+	reqBody, err := json.Marshal(upstreamReq)
+	if err != nil {
+		debugLog("上游请求序列化失败: %v", err)
+		return nil, err
+	}
+
+	debugLog("调用上游API: %s", UpstreamUrl)
+	debugLog("上游请求体: %s", string(reqBody))
+
+	req, err := http.NewRequest("POST", UpstreamUrl, bytes.NewBuffer(reqBody))
+	if err != nil {
+		debugLog("创建HTTP请求失败: %v", err)
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", BrowserUa)
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("Accept-Language", "zh-CN")
+	req.Header.Set("sec-ch-ua", SecChUa)
+	req.Header.Set("sec-ch-ua-mobile", SecChUaMob)
+	req.Header.Set("sec-ch-ua-platform", SecChUaPlat)
+	req.Header.Set("X-FE-Version", XFeVersion)
+	req.Header.Set("Origin", OriginBase)
+	req.Header.Set("Referer", OriginBase+"/c/"+refererChatID)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		debugLog("上游请求失败: %v", err)
+		return nil, err
+	}
+
+	debugLog("上游响应状态: %d %s", resp.StatusCode, resp.Status)
+	return resp, nil
+}
+
+func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+	debugLog("开始处理流式响应 (chat_id=%s)", chatID)
+
+	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
+	if err != nil {
+		debugLog("调用上游失败: %v", err)
+		http.Error(w, "Failed to call upstream", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		debugLog("上游返回错误状态: %d", resp.StatusCode)
+		// 读取错误响应体
+		if DebugMode {
+			body, _ := io.ReadAll(resp.Body)
+			debugLog("上游错误响应: %s", string(body))
+		}
+		http.Error(w, "Upstream error", http.StatusBadGateway)
+		return
+	}
+
+	// 用于策略2：总是展示thinking（配合标签处理）
+	transformThinking := func(s string) string {
+		// 去 <summary>…</summary>
+		s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
+		// 清理残留自定义标签，如 </thinking>、<Full> 等
+		s = strings.ReplaceAll(s, "</thinking>", "")
+		s = strings.ReplaceAll(s, "<Full>", "")
+		s = strings.ReplaceAll(s, "</Full>", "")
+		s = strings.TrimSpace(s)
+		switch ThinkTagsMode {
+		case "think":
+			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
+			s = strings.ReplaceAll(s, "</details>", "</think>")
+		case "strip":
+			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
+			s = strings.ReplaceAll(s, "</details>", "")
+		}
+		// 处理每行前缀 "> "（包括起始位置）
+		s = strings.TrimPrefix(s, "> ")
+		s = strings.ReplaceAll(s, "\n> ", "\n")
+		return strings.TrimSpace(s)
+	}
+
+	// 设置SSE头部
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// 发送第一个chunk（role）
+	firstChunk := OpenAIResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   DefaultModelName,
+		Choices: []Choice{
+			{
+				Index: 0,
+				Delta: Delta{Role: "assistant"},
+			},
+		},
+	}
+	writeSSEChunk(w, firstChunk)
+	flusher.Flush()
+
+	// 读取上游SSE流
+	debugLog("开始读取上游SSE流")
+	scanner := bufio.NewScanner(resp.Body)
+	lineCount := 0
+
+	// 标记是否已发送最初的 answer 片段（来自 EditContent）
+	var sentInitialAnswer bool
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineCount++
+
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		dataStr := strings.TrimPrefix(line, "data: ")
+		if dataStr == "" {
+			continue
+		}
+
+		debugLog("收到SSE数据 (第%d行): %s", lineCount, dataStr)
+
+		var upstreamData UpstreamData
+		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
+			debugLog("SSE数据解析失败: %v", err)
+			continue
+		}
+
+		// 错误检测（data.error 或 data.data.error 或 顶层error）
+		if (upstreamData.Error != nil) || (upstreamData.Data.Error != nil) || (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
+			errObj := upstreamData.Error
+			if errObj == nil {
+				errObj = upstreamData.Data.Error
+			}
+			if errObj == nil && upstreamData.Data.Inner != nil {
+				errObj = upstreamData.Data.Inner.Error
+			}
+			debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
+			// 结束下游流
+			endChunk := OpenAIResponse{
+				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   DefaultModelName,
+				Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: "stop"}},
+			}
+			writeSSEChunk(w, endChunk)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
+		}
+
+		debugLog("解析成功 - 类型: %s, 阶段: %s, 内容长度: %d, 完成: %v",
+			upstreamData.Type, upstreamData.Data.Phase, len(upstreamData.Data.DeltaContent), upstreamData.Data.Done)
+
+		// 策略2：总是展示thinking + answer
+		// 处理EditContent在最初的answer信息（只发送一次）
+		if !sentInitialAnswer && upstreamData.Data.EditContent != "" && upstreamData.Data.Phase == "answer" {
+			var out = upstreamData.Data.EditContent
+			if out != "" {
+				var parts = regexp.MustCompile(`\</details\>`).Split(out, -1)
+				if len(parts) > 1 {
+					var content = parts[1]
+					if content != "" {
+						debugLog("发送普通内容: %s", content)
+						chunk := OpenAIResponse{
+							ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+							Object:  "chat.completion.chunk",
+							Created: time.Now().Unix(),
+							Model:   DefaultModelName,
+							Choices: []Choice{{Index: 0, Delta: Delta{Content: content}}},
+						}
+						writeSSEChunk(w, chunk)
+						flusher.Flush()
+						sentInitialAnswer = true
+					}
+				}
+			}
+		}
+
+		if upstreamData.Data.DeltaContent != "" {
+			var out = upstreamData.Data.DeltaContent
+			if upstreamData.Data.Phase == "thinking" {
+				out = transformThinking(out)
+				// 思考内容使用 reasoning_content 字段
+				if out != "" {
+					debugLog("发送思考内容: %s", out)
+					chunk := OpenAIResponse{
+						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   DefaultModelName,
+						Choices: []Choice{
+							{
+								Index: 0,
+								Delta: Delta{ReasoningContent: out},
+							},
+						},
+					}
+					writeSSEChunk(w, chunk)
+					flusher.Flush()
+				}
+			} else {
+				// 普通内容使用 content 字段
+				if out != "" {
+					debugLog("发送普通内容: %s", out)
+					chunk := OpenAIResponse{
+						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   DefaultModelName,
+						Choices: []Choice{
+							{
+								Index: 0,
+								Delta: Delta{Content: out},
+							},
+						},
+					}
+					writeSSEChunk(w, chunk)
+					flusher.Flush()
+				}
+			}
+		}
+
+		// 检查是否结束
+		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
+			debugLog("检测到流结束信号")
+			// 发送结束chunk
+			endChunk := OpenAIResponse{
+				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   DefaultModelName,
+				Choices: []Choice{
+					{
+						Index:        0,
+						Delta:        Delta{},
+						FinishReason: "stop",
+					},
+				},
+			}
+			writeSSEChunk(w, endChunk)
+			flusher.Flush()
+
+			// 发送[DONE]
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			debugLog("流式响应完成，共处理%d行", lineCount)
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		debugLog("扫描器错误: %v", err)
+	}
+}
+
+func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+	debugLog("开始处理非流式响应 (chat_id=%s)", chatID)
+
+	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
+	if err != nil {
+		debugLog("调用上游失败: %v", err)
+		http.Error(w, "Failed to call upstream", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		debugLog("上游返回错误状态: %d", resp.StatusCode)
+		// 读取错误响应体
+		if DebugMode {
+			body, _ := io.ReadAll(resp.Body)
+			debugLog("上游错误响应: %s", string(body))
+		}
+		http.Error(w, "Upstream error", http.StatusBadGateway)
+		return
+	}
+
+	// 收集完整响应（策略2：thinking与answer都纳入，thinking转换）
+	var fullContent strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	debugLog("开始收集完整响应内容")
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		dataStr := strings.TrimPrefix(line, "data: ")
+		if dataStr == "" {
+			continue
+		}
+
+		var upstreamData UpstreamData
+		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
+			continue
+		}
+
+		if upstreamData.Data.DeltaContent != "" {
+			out := upstreamData.Data.DeltaContent
+			if upstreamData.Data.Phase == "thinking" {
+				out = func(s string) string {
+					// 同步一份转换逻辑（与流式一致）
+					s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
+					s = strings.ReplaceAll(s, "</thinking>", "")
+					s = strings.ReplaceAll(s, "<Full>", "")
+					s = strings.ReplaceAll(s, "</Full>", "")
+					s = strings.TrimSpace(s)
+					switch ThinkTagsMode {
+					case "think":
+						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
+						s = strings.ReplaceAll(s, "</details>", "</think>")
+					case "strip":
+						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
+						s = strings.ReplaceAll(s, "</details>", "")
+					}
+					s = strings.TrimPrefix(s, "> ")
+					s = strings.ReplaceAll(s, "\n> ", "\n")
+					return strings.TrimSpace(s)
+				}(out)
+			}
+			if out != "" {
+				fullContent.WriteString(out)
+			}
+		}
+
+		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
+			debugLog("检测到完成信号，停止收集")
+			break
+		}
+	}
+
+	finalContent := fullContent.String()
+	debugLog("内容收集完成，最终长度: %d", len(finalContent))
+
+	// 构造完整响应
+	response := OpenAIResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   DefaultModelName,
+		Choices: []Choice{
+			{
+				Index: 0,
+				Message: Message{
+					Role:    "assistant",
+					Content: finalContent,
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: Usage{
+			PromptTokens:     0,
+			CompletionTokens: 0,
+			TotalTokens:      0,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+	debugLog("非流式响应发送完成")
+}
